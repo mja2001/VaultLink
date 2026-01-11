@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+/**
+ * @title ContentVault
+ * @dev Manages paywalled content with MNEE token payments
+ * @notice Creators can lock content behind MNEE payments and manage access
+ */
+contract ContentVault is ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
+
+    // MNEE token contract address
+    IERC20 public immutable mneeToken;
+
+    // Content structure
+    struct Content {
+        uint256 id;
+        address creator;
+        uint256 price;
+        string contentURI;
+        bool isActive;
+        uint256 totalPurchases;
+        uint256 totalRevenue;
+        uint256 createdAt;
+    }
+
+    // Storage
+    uint256 private _contentIdCounter;
+    mapping(uint256 => Content) public contents;
+    mapping(uint256 => mapping(address => bool)) public hasAccess;
+    mapping(address => uint256[]) public creatorContents;
+    mapping(address => uint256[]) public userPurchases;
+
+    // Events
+    event ContentCreated(
+        uint256 indexed contentId,
+        address indexed creator,
+        uint256 price,
+        string contentURI
+    );
+
+    event ContentPurchased(
+        uint256 indexed contentId,
+        address indexed buyer,
+        address indexed creator,
+        uint256 price
+    );
+
+    event ContentUpdated(
+        uint256 indexed contentId,
+        uint256 newPrice,
+        bool isActive
+    );
+
+    event AccessGranted(
+        uint256 indexed contentId,
+        address indexed user
+    );
+
+    /**
+     * @dev Constructor
+     * @param _mneeToken Address of MNEE token contract
+     */
+    constructor(address _mneeToken) {
+        require(_mneeToken != address(0), "Invalid MNEE token address");
+        mneeToken = IERC20(_mneeToken);
+    }
+
+    /**
+     * @notice Create new paywalled content
+     * @param price Price in MNEE tokens (with 18 decimals)
+     * @param contentURI IPFS URI of the content
+     * @return contentId The ID of the created content
+     */
+    function createContent(
+        uint256 price,
+        string memory contentURI
+    ) external returns (uint256) {
+        require(price > 0, "Price must be greater than 0");
+        require(bytes(contentURI).length > 0, "Content URI cannot be empty");
+
+        uint256 contentId = _contentIdCounter++;
+
+        contents[contentId] = Content({
+            id: contentId,
+            creator: msg.sender,
+            price: price,
+            contentURI: contentURI,
+            isActive: true,
+            totalPurchases: 0,
+            totalRevenue: 0,
+            createdAt: block.timestamp
+        });
+
+        creatorContents[msg.sender].push(contentId);
+
+        emit ContentCreated(contentId, msg.sender, price, contentURI);
+
+        return contentId;
+    }
+
+    /**
+     * @notice Purchase access to content with MNEE tokens
+     * @param contentId ID of the content to purchase
+     */
+    function purchaseAccess(uint256 contentId) external nonReentrant {
+        Content storage content = contents[contentId];
+
+        require(content.creator != address(0), "Content does not exist");
+        require(content.isActive, "Content is not active");
+        require(!hasAccess[contentId][msg.sender], "Already has access");
+        require(msg.sender != content.creator, "Creator has automatic access");
+
+        // Transfer MNEE from buyer to creator
+        mneeToken.safeTransferFrom(
+            msg.sender,
+            content.creator,
+            content.price
+        );
+
+        // Grant access
+        hasAccess[contentId][msg.sender] = true;
+        userPurchases[msg.sender].push(contentId);
+
+        // Update statistics
+        content.totalPurchases++;
+        content.totalRevenue += content.price;
+
+        emit ContentPurchased(
+            contentId,
+            msg.sender,
+            content.creator,
+            content.price
+        );
+    }
+
+    /**
+     * @notice Grant free access to content (creator only)
+     * @param contentId ID of the content
+     * @param user Address to grant access to
+     */
+    function grantAccess(
+        uint256 contentId,
+        address user
+    ) external {
+        Content storage content = contents[contentId];
+
+        require(msg.sender == content.creator, "Only creator can grant access");
+        require(!hasAccess[contentId][user], "User already has access");
+
+        hasAccess[contentId][user] = true;
+        userPurchases[user].push(contentId);
+
+        emit AccessGranted(contentId, user);
+    }
+
+    /**
+     * @notice Update content price and active status (creator only)
+     * @param contentId ID of the content
+     * @param newPrice New price in MNEE tokens
+     * @param isActive Whether content is active
+     */
+    function updateContent(
+        uint256 contentId,
+        uint256 newPrice,
+        bool isActive
+    ) external {
+        Content storage content = contents[contentId];
+
+        require(msg.sender == content.creator, "Only creator can update");
+        require(newPrice > 0, "Price must be greater than 0");
+
+        content.price = newPrice;
+        content.isActive = isActive;
+
+        emit ContentUpdated(contentId, newPrice, isActive);
+    }
+
+    /**
+     * @notice Check if user has access to content
+     * @param contentId ID of the content
+     * @param user Address to check
+     * @return bool True if user has access
+     */
+    function checkAccess(
+        uint256 contentId,
+        address user
+    ) external view returns (bool) {
+        Content storage content = contents[contentId];
+
+        // Creator always has access
+        if (user == content.creator) {
+            return true;
+        }
+
+        return hasAccess[contentId][user];
+    }
+
+    /**
+     * @notice Get content details
+     * @param contentId ID of the content
+     * @return Content struct
+     */
+    function getContent(uint256 contentId) external view returns (Content memory) {
+        return contents[contentId];
+    }
+
+    /**
+     * @notice Get all content IDs created by a creator
+     * @param creator Address of the creator
+     * @return Array of content IDs
+     */
+    function getCreatorContents(address creator) external view returns (uint256[] memory) {
+        return creatorContents[creator];
+    }
+
+    /**
+     * @notice Get all content IDs purchased by a user
+     * @param user Address of the user
+     * @return Array of content IDs
+     */
+    function getUserPurchases(address user) external view returns (uint256[] memory) {
+        return userPurchases[user];
+    }
+
+    /**
+     * @notice Get total number of contents created
+     * @return Total content count
+     */
+    function getTotalContents() external view returns (uint256) {
+        return _contentIdCounter;
+    }
+
+    /**
+     * @notice Get creator statistics
+     * @param creator Address of the creator
+     * @return totalContents Total number of contents
+     * @return totalRevenue Total revenue earned in MNEE
+     * @return totalPurchases Total number of purchases
+     */
+    function getCreatorStats(address creator) external view returns (
+        uint256 totalContents,
+        uint256 totalRevenue,
+        uint256 totalPurchases
+    ) {
+        uint256[] memory contentIds = creatorContents[creator];
+        totalContents = contentIds.length;
+
+        for (uint256 i = 0; i < contentIds.length; i++) {
+            Content storage content = contents[contentIds[i]];
+            totalRevenue += content.totalRevenue;
+            totalPurchases += content.totalPurchases;
+        }
+
+        return (totalContents, totalRevenue, totalPurchases);
+    }
+}
