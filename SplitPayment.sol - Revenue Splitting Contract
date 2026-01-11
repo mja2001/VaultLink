@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title SplitPayment
+ * @dev Automated revenue splitting for collaborative content
+ * @notice Enables programmable revenue distribution in MNEE tokens
+ */
+contract SplitPayment is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    IERC20 public immutable mneeToken;
+
+    // Revenue split configuration
+    struct Split {
+        uint256 id;
+        address owner;
+        address[] recipients;
+        uint256[] percentages; // in basis points (1% = 100, 100% = 10000)
+        bool isActive;
+        uint256 totalDistributed;
+        uint256 createdAt;
+    }
+
+    // Pending withdrawals
+    mapping(address => uint256) public pendingWithdrawals;
+
+    // Storage
+    uint256 private _splitIdCounter;
+    mapping(uint256 => Split) public splits;
+    mapping(address => uint256[]) public ownerSplits;
+
+    // Events
+    event SplitCreated(
+        uint256 indexed splitId,
+        address indexed owner,
+        address[] recipients,
+        uint256[] percentages
+    );
+
+    event PaymentDistributed(
+        uint256 indexed splitId,
+        uint256 totalAmount,
+        address indexed payer
+    );
+
+    event RevenueWithdrawn(
+        address indexed recipient,
+        uint256 amount
+    );
+
+    event SplitUpdated(
+        uint256 indexed splitId,
+        address[] recipients,
+        uint256[] percentages
+    );
+
+    constructor(address _mneeToken) {
+        require(_mneeToken != address(0), "Invalid MNEE token address");
+        mneeToken = IERC20(_mneeToken);
+    }
+
+    /**
+     * @notice Create a new revenue split configuration
+     * @param recipients Array of recipient addresses
+     * @param percentages Array of percentages in basis points (must sum to 10000)
+     */
+    function createSplit(
+        address[] memory recipients,
+        uint256[] memory percentages
+    ) external returns (uint256) {
+        require(recipients.length > 0, "No recipients provided");
+        require(recipients.length == percentages.length, "Length mismatch");
+        
+        uint256 totalPercentage = 0;
+        for (uint256 i = 0; i < percentages.length; i++) {
+            require(recipients[i] != address(0), "Invalid recipient address");
+            require(percentages[i] > 0, "Percentage must be greater than 0");
+            totalPercentage += percentages[i];
+        }
+        require(totalPercentage == 10000, "Percentages must sum to 100%");
+
+        uint256 splitId = _splitIdCounter++;
+
+        splits[splitId] = Split({
+            id: splitId,
+            owner: msg.sender,
+            recipients: recipients,
+            percentages: percentages,
+            isActive: true,
+            totalDistributed: 0,
+            createdAt: block.timestamp
+        });
+
+        ownerSplits[msg.sender].push(splitId);
+
+        emit SplitCreated(splitId, msg.sender, recipients, percentages);
+
+        return splitId;
+    }
+
+    /**
+     * @notice Distribute payment according to split configuration
+     * @param splitId ID of the split to use
+     * @param amount Total amount of MNEE to distribute
+     */
+    function distributePayment(
+        uint256 splitId,
+        uint256 amount
+    ) external nonReentrant {
+        Split storage split = splits[splitId];
+
+        require(split.owner != address(0), "Split does not exist");
+        require(split.isActive, "Split is not active");
+        require(amount > 0, "Amount must be greater than 0");
+
+        // Transfer total amount from sender to this contract
+        mneeToken.safeTransferFrom(msg.sender, address(this), amount);
+
+        // Distribute to recipients
+        for (uint256 i = 0; i < split.recipients.length; i++) {
+            uint256 share = (amount * split.percentages[i]) / 10000;
+            pendingWithdrawals[split.recipients[i]] += share;
+        }
+
+        split.totalDistributed += amount;
+
+        emit PaymentDistributed(splitId, amount, msg.sender);
+    }
+
+    /**
+     * @notice Withdraw accumulated MNEE revenue
+     */
+    function withdraw() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+
+        require(amount > 0, "No funds to withdraw");
+
+        pendingWithdrawals[msg.sender] = 0;
+
+        mneeToken.safeTransfer(msg.sender, amount);
+
+        emit RevenueWithdrawn(msg.sender, amount);
+    }
+
+    /**
+     * @notice Update split configuration (owner only)
+     * @param splitId ID of the split to update
+     * @param recipients New array of recipients
+     * @param percentages New array of percentages
+     */
+    function updateSplit(
+        uint256 splitId,
+        address[] memory recipients,
+        uint256[] memory percentages
+    ) external {
+        Split storage split = splits[splitId];
+
+        require(msg.sender == split.owner, "Only owner can update");
+        require(recipients.length > 0, "No recipients provided");
+        require(recipients.length == percentages.length, "Length mismatch");
+
+        uint256 totalPercentage = 0;
+        for (uint256 i = 0; i < percentages.length; i++) {
+            require(recipients[i] != address(0), "Invalid recipient address");
+            require(percentages[i] > 0, "Percentage must be greater than 0");
+            totalPercentage += percentages[i];
+        }
+        require(totalPercentage == 10000, "Percentages must sum to 100%");
+
+        split.recipients = recipients;
+        split.percentages = percentages;
+
+        emit SplitUpdated(splitId, recipients, percentages);
+    }
+
+    /**
+     * @notice Deactivate a split configuration
+     * @param splitId ID of the split to deactivate
+     */
+    function deactivateSplit(uint256 splitId) external {
+        Split storage split = splits[splitId];
+
+        require(msg.sender == split.owner, "Only owner can deactivate");
+        require(split.isActive, "Split already inactive");
+
+        split.isActive = false;
+    }
+
+    /**
+     * @notice Get split details
+     * @param splitId ID of the split
+     */
+    function getSplit(uint256 splitId) external view returns (
+        address owner,
+        address[] memory recipients,
+        uint256[] memory percentages,
+        bool isActive,
+        uint256 totalDistributed
+    ) {
+        Split storage split = splits[splitId];
+        return (
+            split.owner,
+            split.recipients,
+            split.percentages,
+            split.isActive,
+            split.totalDistributed
+        );
+    }
+
+    /**
+     * @notice Get all splits created by an owner
+     * @param owner Address of the owner
+     */
+    function getOwnerSplits(address owner) external view returns (uint256[] memory) {
+        return ownerSplits[owner];
+    }
+
+    /**
+     * @notice Get pending withdrawal amount for an address
+     * @param recipient Address to check
+     */
+    function getPendingWithdrawal(address recipient) external view returns (uint256) {
+        return pendingWithdrawals[recipient];
+    }
+
+    /**
+     * @notice Create a simple 70/30 split (convenience function)
+     * @param primaryRecipient Primary recipient (70%)
+     * @param secondaryRecipient Secondary recipient (30%)
+     */
+    function create7030Split(
+        address primaryRecipient,
+        address secondaryRecipient
+    ) external returns (uint256) {
+        address[] memory recipients = new address[](2);
+        recipients[0] = primaryRecipient;
+        recipients[1] = secondaryRecipient;
+
+        uint256[] memory percentages = new uint256[](2);
+        percentages[0] = 7000; // 70%
+        percentages[1] = 3000; // 30%
+
+        return createSplit(recipients, percentages);
+    }
+
+    /**
+     * @notice Create an equal split (convenience function)
+     * @param recipients Array of recipients (equal distribution)
+     */
+    function createEqualSplit(
+        address[] memory recipients
+    ) external returns (uint256) {
+        require(recipients.length > 0, "No recipients provided");
+        require(recipients.length <= 10, "Too many recipients");
+
+        uint256 equalShare = 10000 / recipients.length;
+        uint256 remainder = 10000 % recipients.length;
+
+        uint256[] memory percentages = new uint256[](recipients.length);
+        
+        for (uint256 i = 0; i < recipients.length; i++) {
+            percentages[i] = equalShare;
+            if (i == 0) {
+                percentages[i] += remainder; // Give remainder to first recipient
+            }
+        }
+
+        return createSplit(recipients, percentages);
+    }
+}
