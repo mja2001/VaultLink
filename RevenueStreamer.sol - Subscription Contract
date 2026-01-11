@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title RevenueStreamer
+ * @dev Manages subscription-based content access with MNEE token
+ * @notice Creators can set up recurring subscription tiers with automated billing
+ */
+contract RevenueStreamer is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    IERC20 public immutable mneeToken;
+
+    // Subscription tier structure
+    struct SubscriptionTier {
+        uint256 id;
+        address creator;
+        uint256 price;
+        uint256 duration; // in seconds (e.g., 30 days = 2592000)
+        string name;
+        string benefits;
+        bool isActive;
+        uint256 totalSubscribers;
+        uint256 totalRevenue;
+    }
+
+    // Individual subscription
+    struct Subscription {
+        uint256 tierId;
+        address subscriber;
+        uint256 startTime;
+        uint256 expiryTime;
+        bool isActive;
+        uint256 renewalCount;
+    }
+
+    // Storage
+    uint256 private _tierIdCounter;
+    uint256 private _subscriptionIdCounter;
+
+    mapping(uint256 => SubscriptionTier) public tiers;
+    mapping(uint256 => Subscription) public subscriptions;
+    mapping(address => uint256[]) public creatorTiers;
+    mapping(uint256 => uint256[]) public tierSubscriptions;
+    mapping(address => uint256[]) public userSubscriptions;
+
+    // Events
+    event TierCreated(
+        uint256 indexed tierId,
+        address indexed creator,
+        uint256 price,
+        uint256 duration,
+        string name
+    );
+
+    event Subscribed(
+        uint256 indexed subscriptionId,
+        uint256 indexed tierId,
+        address indexed subscriber,
+        uint256 expiryTime
+    );
+
+    event SubscriptionRenewed(
+        uint256 indexed subscriptionId,
+        uint256 newExpiryTime,
+        uint256 renewalCount
+    );
+
+    event SubscriptionCancelled(
+        uint256 indexed subscriptionId,
+        address indexed subscriber
+    );
+
+    event TierUpdated(
+        uint256 indexed tierId,
+        uint256 newPrice,
+        bool isActive
+    );
+
+    constructor(address _mneeToken) {
+        require(_mneeToken != address(0), "Invalid MNEE token address");
+        mneeToken = IERC20(_mneeToken);
+    }
+
+    /**
+     * @notice Create a new subscription tier
+     * @param price Monthly price in MNEE tokens
+     * @param duration Subscription duration in seconds
+     * @param name Tier name
+     * @param benefits Description of benefits
+     */
+    function createTier(
+        uint256 price,
+        uint256 duration,
+        string memory name,
+        string memory benefits
+    ) external returns (uint256) {
+        require(price > 0, "Price must be greater than 0");
+        require(duration > 0, "Duration must be greater than 0");
+        require(bytes(name).length > 0, "Name cannot be empty");
+
+        uint256 tierId = _tierIdCounter++;
+
+        tiers[tierId] = SubscriptionTier({
+            id: tierId,
+            creator: msg.sender,
+            price: price,
+            duration: duration,
+            name: name,
+            benefits: benefits,
+            isActive: true,
+            totalSubscribers: 0,
+            totalRevenue: 0
+        });
+
+        creatorTiers[msg.sender].push(tierId);
+
+        emit TierCreated(tierId, msg.sender, price, duration, name);
+
+        return tierId;
+    }
+
+    /**
+     * @notice Subscribe to a tier
+     * @param tierId ID of the subscription tier
+     */
+    function subscribe(uint256 tierId) external nonReentrant returns (uint256) {
+        SubscriptionTier storage tier = tiers[tierId];
+
+        require(tier.creator != address(0), "Tier does not exist");
+        require(tier.isActive, "Tier is not active");
+        require(!hasActiveSubscription(msg.sender, tierId), "Already subscribed");
+
+        // Transfer MNEE from subscriber to creator
+        mneeToken.safeTransferFrom(msg.sender, tier.creator, tier.price);
+
+        uint256 subscriptionId = _subscriptionIdCounter++;
+        uint256 expiryTime = block.timestamp + tier.duration;
+
+        subscriptions[subscriptionId] = Subscription({
+            tierId: tierId,
+            subscriber: msg.sender,
+            startTime: block.timestamp,
+            expiryTime: expiryTime,
+            isActive: true,
+            renewalCount: 0
+        });
+
+        tierSubscriptions[tierId].push(subscriptionId);
+        userSubscriptions[msg.sender].push(subscriptionId);
+
+        tier.totalSubscribers++;
+        tier.totalRevenue += tier.price;
+
+        emit Subscribed(subscriptionId, tierId, msg.sender, expiryTime);
+
+        return subscriptionId;
+    }
+
+    /**
+     * @notice Renew an expired subscription
+     * @param subscriptionId ID of the subscription to renew
+     */
+    function renewSubscription(uint256 subscriptionId) external nonReentrant {
+        Subscription storage sub = subscriptions[subscriptionId];
+        SubscriptionTier storage tier = tiers[sub.tierId];
+
+        require(sub.subscriber == msg.sender, "Not subscription owner");
+        require(tier.isActive, "Tier is not active");
+        require(block.timestamp >= sub.expiryTime, "Subscription still active");
+
+        // Transfer MNEE for renewal
+        mneeToken.safeTransferFrom(msg.sender, tier.creator, tier.price);
+
+        sub.expiryTime = block.timestamp + tier.duration;
+        sub.isActive = true;
+        sub.renewalCount++;
+
+        tier.totalRevenue += tier.price;
+
+        emit SubscriptionRenewed(subscriptionId, sub.expiryTime, sub.renewalCount);
+    }
+
+    /**
+     * @notice Cancel subscription (no refund)
+     * @param subscriptionId ID of the subscription to cancel
+     */
+    function cancelSubscription(uint256 subscriptionId) external {
+        Subscription storage sub = subscriptions[subscriptionId];
+
+        require(sub.subscriber == msg.sender, "Not subscription owner");
+        require(sub.isActive, "Subscription already inactive");
+
+        sub.isActive = false;
+
+        emit SubscriptionCancelled(subscriptionId, msg.sender);
+    }
+
+    /**
+     * @notice Update tier pricing and status (creator only)
+     * @param tierId ID of the tier
+     * @param newPrice New price in MNEE
+     * @param isActive Active status
+     */
+    function updateTier(
+        uint256 tierId,
+        uint256 newPrice,
+        bool isActive
+    ) external {
+        SubscriptionTier storage tier = tiers[tierId];
+
+        require(msg.sender == tier.creator, "Only creator can update");
+        require(newPrice > 0, "Price must be greater than 0");
+
+        tier.price = newPrice;
+        tier.isActive = isActive;
+
+        emit TierUpdated(tierId, newPrice, isActive);
+    }
+
+    /**
+     * @notice Check if user has active subscription to tier
+     * @param user Address to check
+     * @param tierId Tier ID
+     * @return bool True if user has active subscription
+     */
+    function hasActiveSubscription(
+        address user,
+        uint256 tierId
+    ) public view returns (bool) {
+        uint256[] memory subs = userSubscriptions[user];
+
+        for (uint256 i = 0; i < subs.length; i++) {
+            Subscription storage sub = subscriptions[subs[i]];
+            if (sub.tierId == tierId && 
+                sub.isActive && 
+                block.timestamp < sub.expiryTime) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @notice Get subscription details
+     * @param subscriptionId ID of the subscription
+     */
+    function getSubscription(uint256 subscriptionId) 
+        external 
+        view 
+        returns (Subscription memory) 
+    {
+        return subscriptions[subscriptionId];
+    }
+
+    /**
+     * @notice Get tier details
+     * @param tierId ID of the tier
+     */
+    function getTier(uint256 tierId) 
+        external 
+        view 
+        returns (SubscriptionTier memory) 
+    {
+        return tiers[tierId];
+    }
+
+    /**
+     * @notice Get all tiers created by creator
+     * @param creator Address of creator
+     */
+    function getCreatorTiers(address creator) 
+        external 
+        view 
+        returns (uint256[] memory) 
+    {
+        return creatorTiers[creator];
+    }
+
+    /**
+     * @notice Get all subscriptions for user
+     * @param user Address of user
+     */
+    function getUserSubscriptions(address user) 
+        external 
+        view 
+        returns (uint256[] memory) 
+    {
+        return userSubscriptions[user];
+    }
+
+    /**
+     * @notice Check if subscription is currently valid
+     * @param subscriptionId ID of subscription
+     */
+    function isSubscriptionValid(uint256 subscriptionId) 
+        external 
+        view 
+        returns (bool) 
+    {
+        Subscription storage sub = subscriptions[subscriptionId];
+        return sub.isActive && block.timestamp < sub.expiryTime;
+    }
+}
